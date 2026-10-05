@@ -107,15 +107,24 @@ jobs:
 
       - name: "7) 打包 AnyKernel3（可直接刷）"
         run: |
-          cp -f kernel/out/arch/arm64/boot/Image.gz anykernel-kona/Image.gz
-          cd anykernel-kona
-          ZIP="kona-ResuKSU-${KERNEL_HEAD}-$(date +%Y%m%d-%H%M).zip"
-          rm -f *.zip
+          set -euo pipefail
+          W="${GITHUB_WORKSPACE}"
+          echo "workspace=$W"; pwd; ls -la "$W" | head -20
+          # 前置检查：源镜像与 AK3 目录都必须存在（失败时打印现场，便于定位）
+          SRC="$W/kernel/out/arch/arm64/boot/Image.gz"
+          AK3="$W/anykernel-kona"
+          if [ ! -f "$SRC" ]; then echo "!! 找不到镜像 $SRC"; ls -l "$W/kernel/out/arch/arm64/boot/" || true; exit 1; fi
+          if [ ! -d "$AK3" ]; then echo "!! 找不到 AK3 目录 $AK3"; ls -la "$W"; exit 1; fi
+          cp -f "$SRC" "$AK3/Image.gz"
+          ls -l "$AK3/Image.gz"
+          cd "$AK3"
+          ZIP="kona-ResuKSU-${KERNEL_HEAD:-unknown}-$(date +%Y%m%d-%H%M).zip"
+          rm -f ./*.zip
           zip -qr "$ZIP" .
           ls -l "$ZIP"; md5sum "$ZIP"
-          echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
-          mkdir -p ../artifact && cp -f "$ZIP" ../artifact/
-
+          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
+          mkdir -p "$W/artifact" && cp -f "$ZIP" "$W/artifact/"
+          ls -l "$W/artifact/"
       - name: "8) 上传产物"
         uses: actions/upload-artifact@v4
         with:
