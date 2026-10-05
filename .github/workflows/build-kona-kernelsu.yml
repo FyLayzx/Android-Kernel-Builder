@@ -33,6 +33,8 @@ env:
   KERNEL_BRANCH: ${{ inputs.kernel_branch }}
   DEFCONFIG: ${{ inputs.defconfig }}
   ZYC_URL: "https://github.com/ZyCromerZ/Clang/releases/download/11.1.0-20220724-release/Clang-11.1.0-20220724.tar.gz"
+  KBUILD_BUILD_USER: "FyLayzx"
+  KBUILD_BUILD_HOST: "kona-ci"
 
 jobs:
   build:
@@ -91,6 +93,9 @@ jobs:
       - name: "6) 编译 Image.gz"
         run: |
           cd kernel
+          # 编译者标识（内核 banner 里显示为 FyLayzx@kona-ci）
+          export KBUILD_BUILD_USER=FyLayzx
+          export KBUILD_BUILD_HOST=kona-ci
           make O=out ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
             OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip LLVM=1 LLVM_IAS=1 \
