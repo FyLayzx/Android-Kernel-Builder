@@ -11,7 +11,6 @@ name: "Build kona kernel (ReSukiSU)"
 #   4) 必须 CROSS_COMPILE=aarch64-linux-gnu-：否则 ZyC 的 clang 会按 x86_64 主机编译
 #   5) 工具链 ZyC clang 11.1.0 整包（内含 LLD 11.1.0 + binutils 2.39.50），与内核作者一致；
 #      该包解压后【没有顶层目录】，bin/ 直接落在解压目录下
-#   6) runner 直连 GitHub 足够快（406MB 约 17 秒），不需要任何镜像加速
 
 on:
   workflow_dispatch:
