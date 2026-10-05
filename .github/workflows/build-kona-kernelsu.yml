@@ -3,14 +3,26 @@ name: "Build kona kernel (ReSukiSU)"
 # kona (OPPO sm8250 / 4.19.160) 内核自动编译
 # 配方 = 2026-10 实测「可开机 + KernelSU 生效」的那一套
 #
-# 为什么这样写（每条都是实测踩出来的，改动前先读）：
-#   1) KSU 用 ReSukiSU/BakaSU：KernelSU 官方早已不支持 non-GKI(4.19)
-#   2) 必须 CONFIG_KSU_MANUAL_HOOK=y：TRACEPOINT_HOOK(自动钩子) 在 non-GKI 上会被 Kbuild 直接拒绝
-#   3) 不用 `make <defconfig名>`：本树上 kbuild 的 defconfig 目标解析不可靠
+# 【为什么拆成两个 job】
+#   GitHub 的 "Re-run failed jobs" 只在 job 级别生效，job 内部不能续跑。
+#   所以拆成:
+#     job1 build   : 拉源码 + KSU + 工具链 + 编译 + 上传 Image.gz（约 21 分钟）
+#     job2 package : 下载 Image.gz + 打包成可刷的 AnyKernel3 zip（几秒）
+#   若打包环节出错（路径/权限之类），直接 Re-run failed jobs 即可，
+#   只会重跑 job2，不会再花 21 分钟重编。
+#
+# 【其它实测踩过的坑（勿改）】
+#   1) KSU 用 ReSukiSU/BakaSU：官方 tiann/KernelSU 已不支持 non-GKI(4.19)
+#   2) 必须 CONFIG_KSU_MANUAL_HOOK=y；TRACEPOINT_HOOK 在 non-GKI 会被 Kbuild 拒绝
+#   3) 不用 `make <defconfig名>`：本树 kbuild 的 defconfig 目标解析不可靠
 #      → 直接铺成 out/.config，再跑 olddefconfig
-#   4) 必须 CROSS_COMPILE=aarch64-linux-gnu-：否则 ZyC 的 clang 会按 x86_64 主机编译
-#   5) 工具链 ZyC clang 11.1.0 整包（内含 LLD 11.1.0 + binutils 2.39.50），与内核作者一致；
+#   4) 必须 CROSS_COMPILE=aarch64-linux-gnu-，否则 clang 按 x86_64 主机编译
+#   5) 工具链 ZyC clang 11.1.0 整包（含 LLD 11.1.0 + binutils 2.39.50）；
 #      该包解压后【没有顶层目录】，bin/ 直接落在解压目录下
+#   6) runner 直连 GitHub 足够快（406MB 约 17 秒），无需镜像加速
+#   7) 上传 artifact 只给【单个目录】dist/：upload-artifact@v4 对多个搜索路径
+#      会取最近公共祖先当根目录，多路径写法会让 artifact 里多一层
+#      kernel/out/arch/arm64/boot/ 的壳，job2 就取不到 Image.gz
 
 on:
   workflow_dispatch:
@@ -37,7 +49,12 @@ env:
   KBUILD_BUILD_HOST: "kona-ci"
 
 jobs:
+  # ============================================================
+  # job1: 编译内核（耗时大头，约 21 分钟）
+  # 产物: artifact "kernel-image"  (Image.gz + build-info.txt)
+  # ============================================================
   build:
+    name: "build / 编译"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -59,7 +76,6 @@ jobs:
           cd kernel
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           echo "KSU: $(cd KernelSU && git log -1 --format='%h %s' | cut -c1-70)"
-          # BakaSU 要求 KernelSU/.git 与其 kernel/ 同级存在
           ln -sfn ../KernelSU/kernel drivers/kernelsu
           ls -ld drivers/kernelsu
 
@@ -68,7 +84,6 @@ jobs:
           mkdir -p tc/zyc && cd tc/zyc
           curl -fL --retry 3 -o zyc.tar.gz "$ZYC_URL"
           ls -l zyc.tar.gz
-          # 该压缩包没有顶层目录，直接解压即得到 bin/ lib/ ...
           tar -xzf zyc.tar.gz
           rm -f zyc.tar.gz
           echo "clang : $(./bin/clang --version | head -1)"
@@ -92,52 +107,127 @@ jobs:
 
       - name: "6) 编译 Image.gz"
         run: |
-          cd kernel
-          # 编译者标识（内核 banner 里显示为 FyLayzx@kona-ci）
+          set -euo pipefail
+          W="${GITHUB_WORKSPACE}"
+          cd "$W/kernel"
+          # 编译者标识（内核 banner 显示为 FyLayzx@kona-ci）
           export KBUILD_BUILD_USER=FyLayzx
           export KBUILD_BUILD_HOST=kona-ci
           make O=out ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
             OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            -j"$(nproc)" Image.gz 2>&1 | tee ../build.log
-          IMG=out/arch/arm64/boot/Image.gz
+            -j"$(nproc)" Image.gz 2>&1 | tee "$W/build.log"
+          IMG="$W/kernel/out/arch/arm64/boot/Image.gz"
+          test -f "$IMG" || { echo "!! 编译完成但找不到 $IMG"; exit 1; }
           ls -l "$IMG"
-          echo "banner: $(zcat $IMG | strings | grep -m1 'Linux version')"
+          BANNER=$(zcat "$IMG" | strings | grep -m1 'Linux version' || true)
+          echo "banner: $BANNER"
+          {
+            echo "KERNEL_HEAD=$KERNEL_HEAD"
+            echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+            echo "DEFCONFIG=$DEFCONFIG"
+            echo "KSU_HEAD=$(cd "$W/kernel/KernelSU" && git rev-parse --short HEAD)"
+            echo "BANNER=$BANNER"
+            echo "IMAGE_MD5=$(md5sum "$IMG" | cut -d' ' -f1)"
+            echo "IMAGE_BYTES=$(wc -c < "$IMG")"
+            echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee "$W/build-info.txt"
 
-      - name: "7) 打包 AnyKernel3（可直接刷）"
+      - name: "7) 归集产物（铺平成 dist/，避免 artifact 里带目录壳）"
         run: |
           set -euo pipefail
           W="${GITHUB_WORKSPACE}"
-          echo "workspace=$W"; pwd; ls -la "$W" | head -20
-          # 前置检查：源镜像与 AK3 目录都必须存在（失败时打印现场，便于定位）
-          SRC="$W/kernel/out/arch/arm64/boot/Image.gz"
-          AK3="$W/anykernel-kona"
-          if [ ! -f "$SRC" ]; then echo "!! 找不到镜像 $SRC"; ls -l "$W/kernel/out/arch/arm64/boot/" || true; exit 1; fi
-          if [ ! -d "$AK3" ]; then echo "!! 找不到 AK3 目录 $AK3"; ls -la "$W"; exit 1; fi
-          cp -f "$SRC" "$AK3/Image.gz"
-          ls -l "$AK3/Image.gz"
-          cd "$AK3"
-          ZIP="kona-ResuKSU-${KERNEL_HEAD:-unknown}-$(date +%Y%m%d-%H%M).zip"
-          rm -f ./*.zip
-          zip -qr "$ZIP" .
-          ls -l "$ZIP"; md5sum "$ZIP"
-          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
-          mkdir -p "$W/artifact" && cp -f "$ZIP" "$W/artifact/"
-          ls -l "$W/artifact/"
-      - name: "8) 上传产物"
+          # ⚠️ 坑：upload-artifact@v4 对【多个搜索路径】取最近公共祖先当根目录。
+          # 若直接写 path: | kernel/out/.../Image.gz 和 build-info.txt，
+          # 根目录会变成仓库根，artifact 里就带着 kernel/out/arch/arm64/boot/ 这层壳，
+          # job2 按 $W/in/Image.gz 取就会「找不到镜像」。
+          # 这里先归集成单个目录 dist/，上传时只给一个目录路径，层级才是干净的。
+          mkdir -p "$W/dist"
+          cp -f "$W/kernel/out/arch/arm64/boot/Image.gz" "$W/dist/Image.gz"
+          cp -f "$W/build-info.txt" "$W/dist/build-info.txt"
+          ls -l "$W/dist/"
+
+      - name: "8) 上传内核镜像（供 job2 打包）"
         uses: actions/upload-artifact@v4
         with:
-          name: kona-ResuKSU-${{ env.KERNEL_HEAD }}
-          path: artifact/*.zip
-          if-no-files-found: erro
-          retention-days: 30
+          name: kernel-image
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
 
-      - name: "9) 失败时上传编译日志"
+      - name: "9) 编译失败时上传日志"
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ env.KERNEL_HEAD }}
+          name: build-log
           path: build.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # ============================================================
+  # job2: 打包 AnyKernel3（几秒钟）
+  # 只依赖 job1 上传的 artifact；此 job 失败时可直接 Re-run failed jobs
+  # ============================================================
+  package:
+    name: "package / 打包"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: "1) 取回编译好的镜像"
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-image
+          path: in
+
+      - name: "2) 拉取 AK3 打包模板（来自本仓库）"
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: "3) 打包（绝对路径 + 前置检查）"
+        run: |
+          set -euo pipefail
+          W="$GITHUB_WORKSPACE"
+          echo "workspace=$W"; pwd
+          echo "--- 下载到的文件 ---"; find "$W/in" -type f -exec ls -l {} \;
+          echo "--- 仓库内容 ---"; ls -la "$W/repo" | head -20
+
+          IMG="$W/in/Image.gz"
+          # 双保险：万一 artifact 里仍残留目录层级，用 find 兜底定位
+          [ -f "$IMG" ] || IMG=$(find "$W/in" -type f -name 'Image.gz' | head -1)
+          BI="$W/in/build-info.txt"
+          [ -f "$BI" ] || BI=$(find "$W/in" -type f -name 'build-info.txt' | head -1)
+          AK3="$W/repo/anykernel-kona"
+          [ -n "$IMG" ] && [ -f "$IMG" ] || { echo "!! 找不到镜像（$W/in 下无 Image.gz）"; exit 1; }
+          [ -d "$AK3" ] || { echo "!! 找不到 AK3 目录 $AK3"; ls -la "$W/repo"; exit 1; }
+
+          KERNEL_HEAD=$(grep -m1 '^KERNEL_HEAD=' "$BI" | cut -d= -f2)
+          [ -n "$KERNEL_HEAD" ] || KERNEL_HEAD=unknown
+          echo "IMG=$IMG"
+          echo "--- 构建信息 ---"; cat "$BI"
+
+          cp -f "$IMG" "$AK3/Image.gz"
+          ls -l "$AK3/Image.gz"
+          cd "$AK3"
+          ZIP="kona-ResuKSU-${KERNEL_HEAD}-$(date +%Y%m%d-%H%M).zip"
+          rm -f ./*.zip
+          zip -qr "$ZIP" .
+          ls -l "$ZIP"; md5sum "$ZIP"
+          mkdir -p "$W/artifact"
+          cp -f "$ZIP" "$W/artifact/"
+          if [ -n "$BI" ] && [ -f "$BI" ]; then cp -f "$BI" "$W/artifact/"; fi
+          {
+            echo "ZIP_NAME=$ZIP"
+            echo "ZIP_MD5=$(md5sum "$ZIP" | cut -d' ' -f1)"
+          } | tee "$W/artifact/zip-info.txt"
+          echo "--- 最终产物 ---"; ls -l "$W/artifact/"
+
+      - name: "4) 上传可刷包"
+        uses: actions/upload-artifact@v4
+        with:
+          name: kona-ResuKSU-flashable
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 90
