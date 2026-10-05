@@ -1,22 +1,23 @@
 name: "Build kona kernel (ReSukiSU)"
 
-# 固化自实测配方（2026-10 实测可开机 + KernelSU 生效）
-# 关键点（都是踩过的坑，勿改）：
-#   1) KSU 用 ReSukiSU/BakaSU，官方 tiann/KernelSU 已不支持 non-GKI(4.19)
-#   2) 必须 CONFIG_KSU_MANUAL_HOOK=y；TRACEPOINT_HOOK 在 non-GKI 上会被 Kbuild 直接拒绝
-#   3) 本树 `make <defconfig名>` 解析不可靠 → 直接铺 .config 再 olddefconfig
-#   4) 必须 CROSS_COMPILE=aarch64-linux-gnu-，否则 clang 按 x86_64 主机编译
-#   5) 工具链用 ZyC clang 11.1.0 整包（含 LLD 11.1.0 + binutils 2.39.50），与作者一致
+# kona (OPPO sm8250 / 4.19.160) 内核自动编译
+# 配方 = 2026-10 实测「可开机 + KernelSU 生效」的那一套
+#
+# 为什么这样写（每条都是实测踩出来的，改动前先读）：
+#   1) KSU 用 ReSukiSU/BakaSU：KernelSU 官方早已不支持 non-GKI(4.19)
+#   2) 必须 CONFIG_KSU_MANUAL_HOOK=y：TRACEPOINT_HOOK(自动钩子) 在 non-GKI 上会被 Kbuild 直接拒绝
+#   3) 不用 `make <defconfig名>`：本树上 kbuild 的 defconfig 目标解析不可靠
+#      → 直接铺成 out/.config，再跑 olddefconfig
+#   4) 必须 CROSS_COMPILE=aarch64-linux-gnu-：否则 ZyC 的 clang 会按 x86_64 主机编译
+#   5) 工具链 ZyC clang 11.1.0 整包（内含 LLD 11.1.0 + binutils 2.39.50），与内核作者一致；
+#      该包解压后【没有顶层目录】，bin/ 直接落在解压目录下
+#   6) runner 直连 GitHub 足够快（406MB 约 17 秒），不需要任何镜像加速
 
 on:
   workflow_dispatch:
     inputs:
-      use_proxy:
-        description: "经 gh-proxy 下载（国内更快，若失败自动回退直连）"
-        type: boolean
-        default: true
       kernel_repo:
-        description: "内核仓库（留空=本人 fork）"
+        description: "内核仓库"
         type: string
         default: "https://github.com/FyLayzx/android_kernel_OPPO_sm8250.git"
       kernel_branch:
@@ -24,7 +25,7 @@ on:
         type: string
         default: "stock/13.1"
       defconfig:
-        description: "configs 目录下的配置文件名"
+        description: "arch/arm64/configs/ 下的配置文件名"
         type: string
         default: "kona-resukisu-defconfig"
 
@@ -32,85 +33,52 @@ env:
   KERNEL_REPO: ${{ inputs.kernel_repo }}
   KERNEL_BRANCH: ${{ inputs.kernel_branch }}
   DEFCONFIG: ${{ inputs.defconfig }}
-  USE_PROXY: ${{ inputs.use_proxy }}
   ZYC_URL: "https://github.com/ZyCromerZ/Clang/releases/download/11.1.0-20220724-release/Clang-11.1.0-20220724.tar.gz"
-  PROXY: "https://v4.gh-proxy.org/"
 
 jobs:
   build:
-    name: "kona / ReSukiSU"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: "0) 环境信息"
-        run: |
-          echo "内核仓库 : $KERNEL_REPO"
-          echo "分支     : $KERNEL_BRANCH"
-          echo "配置     : $DEFCONFIG"
-          echo "CPU      : $(nproc)"
-          df -h / | tail -1
-
       - name: "1) 安装依赖"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential bc bison flex libssl-dev \
             libelf-dev zip unzip curl wget git python3 cpio rsync
 
-      - name: "2) 拉取内核源码（depth=1）"
+      - name: "2) 拉取内核源码"
         run: |
-          set -e
-          if [ "$USE_PROXY" = "true" ]; then
-            git clone --depth=1 --branch "$KERNEL_BRANCH" "${PROXY}${KERNEL_REPO}" kernel \
-              || git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
-          else
-            git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel \
-              || git clone --depth=1 --branch "$KERNEL_BRANCH" "${PROXY}${KERNEL_REPO}" kernel
-          fi
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           cd kernel
           echo "HEAD: $(git rev-parse --short HEAD)  $(git log -1 --format=%s | cut -c1-60)"
           echo "KERNEL_HEAD=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
       - name: "3) 拉取 ReSukiSU/BakaSU 并接线"
         run: |
-          set -e
           cd kernel
-          RE='https://github.com/ReSukiSU/ReSukiSU.git'
-          if [ "$USE_PROXY" = "true" ]; then
-            git clone --depth=1 "${PROXY}${RE}" KernelSU || git clone --depth=1 "$RE" KernelSU
-          else
-            git clone --depth=1 "$RE" KernelSU || git clone --depth=1 "${PROXY}${RE}" KernelSU
-          fi
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           echo "KSU: $(cd KernelSU && git log -1 --format='%h %s' | cut -c1-70)"
           # BakaSU 要求 KernelSU/.git 与其 kernel/ 同级存在
           ln -sfn ../KernelSU/kernel drivers/kernelsu
           ls -ld drivers/kernelsu
-          # 防误提交（CI 内无所谓，但保持与本地一致）
-          printf 'KernelSU/\ndrivers/kernelsu\n' >> .git/info/exclude
 
       - name: "4) 获取工具链 ZyC clang 11.1.0"
         run: |
-          set -e
-          mkdir -p tc && cd tc
-          if [ "$USE_PROXY" = "true" ]; then
-            curl -fL --retry 3 -o zyc.tar.gz "${PROXY}${ZYC_URL}" || curl -fL --retry 3 -o zyc.tar.gz "$ZYC_URL"
-          else
-            curl -fL --retry 3 -o zyc.tar.gz "$ZYC_URL" || curl -fL --retry 3 -o zyc.tar.gz "${PROXY}${ZYC_URL}"
-          fi
+          mkdir -p tc/zyc && cd tc/zyc
+          curl -fL --retry 3 -o zyc.tar.gz "$ZYC_URL"
           ls -l zyc.tar.gz
+          # 该压缩包没有顶层目录，直接解压即得到 bin/ lib/ ...
           tar -xzf zyc.tar.gz
-          # 解压后可能多一层目录，统一成 zyc/
-          SRC=$(find . -maxdepth 2 -type d -name bin | head -1 | xargs dirname)
-          mv "$SRC" zyc
-          echo "工具链: $(./zyc/bin/clang --version | head -1)"
-          echo "$(pwd)/zyc/bin" >> $GITHUB_PATH
+          rm -f zyc.tar.gz
+          echo "clang : $(./bin/clang --version | head -1)"
+          echo "lld   : $(./bin/ld.lld --version | head -1)"
+          echo "$(pwd)/bin" >> $GITHUB_PATH
 
-      - name: "5) 铺配置并 olddefconfig（不用 defconfig 目标）"
+      - name: "5) 铺配置并 olddefconfig"
         run: |
-          set -e
           cd kernel
           CFG="arch/arm64/configs/${DEFCONFIG}"
-          test -f "$CFG" || { echo "!! 找不到 $CFG"; ls arch/arm64/configs/ | head -20; exit 1; }
-          echo "配置大小: $(wc -c < $CFG) 字节 / $(wc -l < $CFG) 行"
+          test -f "$CFG" || { echo "!! 找不到 $CFG"; ls arch/arm64/configs/; exit 1; }
           mkdir -p out
           cp -f "$CFG" out/.config
           make O=out ARCH=arm64 \
@@ -118,34 +86,26 @@ jobs:
             OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
-          echo "--- 关键配置确认 ---"
-          grep -E "^CONFIG_(KSU=|KSU_MANUAL_HOOK|KSU_TRACEPOINT|RELR|TOOLS_SUPPORT_RELR|LOCALVERSION|QCA_CLD_WLAN|QCA_CLD_WLAN_PROFILE)" out/.config || true
+          echo "--- 关键配置 ---"
+          grep -E "^CONFIG_(KSU=|KSU_MANUAL_HOOK|RELR|LOCALVERSION|QCA_CLD_WLAN|QCA_CLD_WLAN_PROFILE)" out/.config
 
       - name: "6) 编译 Image.gz"
         run: |
-          set -e
           cd kernel
-          export ARCH=arm64 SUBARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
           make O=out ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
             OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             -j"$(nproc)" Image.gz 2>&1 | tee ../build.log
-          echo "--- BakaSU 钩子校验结果 ---"
-          grep -E "BakaSU/(manual_hook|compat)|You lost|incompatible" ../build.log | head -20
           IMG=out/arch/arm64/boot/Image.gz
           ls -l "$IMG"
           echo "banner: $(zcat $IMG | strings | grep -m1 'Linux version')"
-          echo "KSU 字符串数: $(zcat $IMG | strings | grep -ciE 'kernelsu|bakasu|resukisu')"
 
       - name: "7) 打包 AnyKernel3（可直接刷）"
         run: |
-          set -e
           cp -f kernel/out/arch/arm64/boot/Image.gz anykernel-kona/Image.gz
           cd anykernel-kona
-          STAMP=$(date +%Y%m%d-%H%M)
-          ZIP="kona-ResuKSU-${KERNEL_HEAD}-${STAMP}.zip"
+          ZIP="kona-ResuKSU-${KERNEL_HEAD}-$(date +%Y%m%d-%H%M).zip"
           rm -f *.zip
           zip -qr "$ZIP" .
           ls -l "$ZIP"; md5sum "$ZIP"
@@ -157,10 +117,10 @@ jobs:
         with:
           name: kona-ResuKSU-${{ env.KERNEL_HEAD }}
           path: artifact/*.zip
-          if-no-files-found: error
+          if-no-files-found: erro
           retention-days: 30
 
-      - name: "9) 失败时上传日志"
+      - name: "9) 失败时上传编译日志"
         if: failure()
         uses: actions/upload-artifact@v4
         with:
